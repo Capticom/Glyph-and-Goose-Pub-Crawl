@@ -11,1454 +11,903 @@
 </head>
 <body>
     <div id="root"></div>
-    
+
     <script type="text/babel">
         const { useState } = React;
 
-        function PubCrawlPlanner() {
-          const [pubs, setPubs] = useState([]);
-          const [sortBy, setSortBy] = useState('letter');
-          const [filterLetter, setFilterLetter] = useState('all');
-          const [routes, setRoutes] = useState([]);
-          const [statusMessage, setStatusMessage] = useState('');
-          const [debugLog, setDebugLog] = useState([]);
-          const [homeLocation, setHomeLocation] = useState({ lat: 51.4817, lon: -0.1130 });
-          const [startingArea, setStartingArea] = useState('any');
-          const [startingPub, setStartingPub] = useState(null);
-
-          const getFirstLetter = (name) => {
-            const cleanName = name.replace(/^the\s+/i, '');
-            return cleanName.charAt(0).toUpperCase();
-          };
-
-          const processGeoJSON = (geojson) => {
-            const features = geojson.features || [];
-            const processed = [];
-
-            features.forEach(feature => {
-              const props = feature.properties || {};
-              const geometry = feature.geometry;
-              
-              if (props.amenity === 'pub' && props.name && geometry) {
-                const firstLetter = getFirstLetter(props.name);
-                
-                if (['G', 'L', 'Y', 'P', 'H', 'O', 'S', 'E'].includes(firstLetter)) {
-                  let lat, lon;
-                  
-                  if (geometry.type === 'Point') {
-                    lon = geometry.coordinates[0];
-                    lat = geometry.coordinates[1];
-                  } else if (geometry.type === 'Polygon' || geometry.type === 'LineString') {
-                    const coords = geometry.type === 'Polygon' ? geometry.coordinates[0] : geometry.coordinates;
-                    let sumLat = 0, sumLon = 0;
-                    coords.forEach(coord => {
-                      sumLon += coord[0];
-                      sumLat += coord[1];
-                    });
-                    lon = sumLon / coords.length;
-                    lat = sumLat / coords.length;
-                  } else {
-                    return;
-                  }
-                  
-                  if (lat != null && lon != null && !isNaN(lat) && !isNaN(lon)) {
-                    processed.push({
-                      name: props.name,
-                      firstLetter: firstLetter,
-                      lat: lat,
-                      lon: lon,
-                      address: props['addr:street'] || 'N/A',
-                      city: props['addr:city'] || 'N/A'
-                    });
-                  }
-                }
-              }
-            });
-
-            return processed;
-          };
-
-          const handleFileUpload = (event) => {
-            const file = event.target.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              try {
-                const geojson = JSON.parse(e.target.result);
-                const processed = processGeoJSON(geojson);
-                setPubs(processed);
-                setRoutes([]);
-                setStatusMessage(`Loaded ${processed.length} pubs`);
-                setDebugLog([]);
-              } catch (error) {
-                alert('Error parsing GeoJSON file: ' + error.message);
-              }
-            };
-            reader.readAsText(file);
-          };
-
-          const calculateDistance = (lat1, lon1, lat2, lon2) => {
-            if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) {
-              return NaN;
-            }
-            if (typeof lat1 !== 'number' || typeof lon1 !== 'number' || 
-                typeof lat2 !== 'number' || typeof lon2 !== 'number') {
-              return NaN;
-            }
-            
-            const R = 6371;
-            const dLat = (lat2 - lat1) * Math.PI / 180;
-            const dLon = (lon2 - lon1) * Math.PI / 180;
-            const a = 
-              Math.sin(dLat/2) * Math.sin(dLat/2) +
-              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-              Math.sin(dLon/2) * Math.sin(dLon/2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-            return R * c;
-          };
-
-          const generateRouteForward = (startPub, endPub, allPubs, variation = 0) => {
-            const sequence = ['G', 'L', 'Y', 'P', 'H', 'G', 'O', 'O', 'S', 'E'];
-            const route = [{ pub: startPub, distance: 0, letter: 'G' }];
-            const usedPubIds = new Set([startPub.name + startPub.lat]);
-            
-            let currentLat = startPub.lat;
-            let currentLon = startPub.lon;
-            let totalDistance = 0;
-
-            for (let i = 1; i < sequence.length; i++) {
-              const targetLetter = sequence[i];
-              
-              if (i === sequence.length - 1) {
-                const finalDist = calculateDistance(currentLat, currentLon, endPub.lat, endPub.lon);
-                route.push({
-                  pub: endPub,
-                  distance: finalDist,
-                  letter: 'E'
-                });
-                totalDistance += finalDist;
-                break;
-              }
-              
-              const candidates = allPubs.filter(p => 
-                p.firstLetter === targetLetter && 
-                !usedPubIds.has(p.name + p.lat) &&
-                p.lat != null &&
-                p.lon != null
-              );
-              
-              if (candidates.length === 0) return null;
-              
-              const scoredCandidates = [];
-              
-              for (const pub of candidates) {
-                const pubLat = typeof pub.lat === 'number' ? pub.lat : parseFloat(pub.lat);
-                const pubLon = typeof pub.lon === 'number' ? pub.lon : parseFloat(pub.lon);
-                
-                if (isNaN(pubLat) || isNaN(pubLon)) continue;
-                
-                const distFromCurrent = calculateDistance(currentLat, currentLon, pubLat, pubLon);
-                const distToEnd = calculateDistance(pubLat, pubLon, endPub.lat, endPub.lon);
-                
-                if (isNaN(distFromCurrent) || isNaN(distToEnd)) continue;
-                
-                let score;
-                
-                if (i === sequence.length - 2) {
-                  if (distToEnd > 1.0) {
-                    const penalty = (distToEnd - 1.0) * 5;
-                    score = (distFromCurrent * 0.3) + (distToEnd * 0.7) + penalty;
-                  } else {
-                    score = (distFromCurrent * 0.4) + (distToEnd * 0.6);
-                  }
-                } else {
-                  const progressWeight = 0.3 + (i / sequence.length * 0.3);
-                  const nearWeight = 1 - progressWeight;
-                  score = (distFromCurrent * nearWeight) + (distToEnd * progressWeight);
-                }
-                
-                scoredCandidates.push({ pub, score });
-              }
-              
-              if (scoredCandidates.length === 0) return null;
-              
-              scoredCandidates.sort((a, b) => a.score - b.score);
-              
-              let selectedPub;
-              if (variation === 0) {
-                selectedPub = scoredCandidates[0].pub;
-              } else {
-                const topN = Math.min(5, scoredCandidates.length);
-                const index = (variation - 1) % topN;
-                selectedPub = scoredCandidates[index].pub;
-              }
-              
-              const stepDist = calculateDistance(currentLat, currentLon, selectedPub.lat, selectedPub.lon);
-              
-              route.push({
-                pub: selectedPub,
-                distance: stepDist,
-                letter: targetLetter
-              });
-              
-              usedPubIds.add(selectedPub.name + selectedPub.lat);
-              currentLat = selectedPub.lat;
-              currentLon = selectedPub.lon;
-              totalDistance += stepDist;
-            }
-
-            return { route, totalDistance };
-          };
-
-          const calculateOptimalRoutes = () => {
-            try {
-              setStatusMessage('Starting calculation...');
-              setDebugLog([]);
-              
-              const ePubs = pubs.filter(p => p.firstLetter === 'E');
-              
-              if (ePubs.length === 0) {
-                setStatusMessage('ERROR: No pubs starting with E found!');
-                return;
-              }
-              
-              ePubs.sort((a, b) => {
-                const distA = calculateDistance(a.lat, a.lon, homeLocation.lat, homeLocation.lon);
-                const distB = calculateDistance(b.lat, b.lon, homeLocation.lat, homeLocation.lon);
-                return distA - distB;
-              });
-              
-              const closestEPub = ePubs[0];
-              const closestEDist = calculateDistance(closestEPub.lat, closestEPub.lon, homeLocation.lat, homeLocation.lon);
-              
-              setStatusMessage(`Found ${ePubs.length} E pubs. Using closest to Oval as endpoint...`);
-              setDebugLog([
-                `Closest E pub to Oval: ${closestEPub.name} (${closestEDist.toFixed(2)}km away)`,
-                `All routes will end at this pub`
-              ]);
-              
-              const letterCounts = {};
-              pubs.forEach(p => {
-                letterCounts[p.firstLetter] = (letterCounts[p.firstLetter] || 0) + 1;
-              });
-              
-              const needed = { G: 2, L: 1, Y: 1, P: 1, H: 1, O: 2, S: 1, E: 1 };
-              const missing = [];
-              for (const [letter, count] of Object.entries(needed)) {
-                if (!letterCounts[letter] || letterCounts[letter] < count) {
-                  missing.push(`${letter} (need ${count}, have ${letterCounts[letter] || 0})`);
-                }
-              }
-              
-              if (missing.length > 0) {
-                setStatusMessage(`ERROR: Missing letters: ${missing.join(', ')}`);
-                return;
-              }
-              
-              let gPubs = pubs.filter(p => p.firstLetter === 'G');
-              
-              if (startingPub) {
-                gPubs = [startingPub];
-                setStatusMessage(`Finding routes from ${startingPub.name} to ${closestEPub.name}...`);
-                setDebugLog(prev => [...prev, `Generating multiple route variations from ${startingPub.name}...`]);
-              } else if (startingArea !== 'any') {
-                const areaCoords = {
-                  soho: { lat: 51.5136, lon: -0.1358 },
-                  coventGarden: { lat: 51.5117, lon: -0.1232 },
-                  shoreditch: { lat: 51.5251, lon: -0.0823 },
-                  camden: { lat: 51.5392, lon: -0.1426 },
-                  southBank: { lat: 51.5074, lon: -0.1198 }
-                };
-                
-                const areaCenter = areaCoords[startingArea];
-                if (areaCenter) {
-                  gPubs = gPubs.filter(g => {
-                    const dist = calculateDistance(g.lat, g.lon, areaCenter.lat, areaCenter.lon);
-                    return dist <= 1.5;
-                  }).sort((a, b) => {
-                    const distA = calculateDistance(a.lat, a.lon, areaCenter.lat, areaCenter.lon);
-                    const distB = calculateDistance(b.lat, b.lon, areaCenter.lat, areaCenter.lon);
-                    return distA - distB;
-                  });
-                  
-                  setStatusMessage(`Finding routes from ${startingArea} to ${closestEPub.name}...`);
-                  setDebugLog(prev => [...prev, `Found ${gPubs.length} G pubs in ${startingArea}`]);
-                }
-              } else {
-                setStatusMessage(`Finding best routes ending at ${closestEPub.name}...`);
-              }
-              
-              if (gPubs.length === 0) {
-                setStatusMessage('ERROR: No suitable starting pubs found in selected area!');
-                return;
-              }
-              
-              const allRoutes = [];
-              const maxToTest = startingPub ? 1 : Math.min(30, gPubs.length);
-              
-              setDebugLog(prev => [...prev, `Testing ${maxToTest} starting points (routes will move towards Oval)...`]);
-              
-              if (startingPub) {
-                for (let v = 0; v < 20; v++) {
-                  const route = generateRouteForward(startingPub, closestEPub, pubs, v);
-                  if (route) {
-                    route.distanceToHome = closestEDist;
-                    route.endPubName = closestEPub.name;
-                    route.startPubName = startingPub.name;
-                    route.variation = v;
-                    allRoutes.push(route);
-                  }
-                }
-                setDebugLog(prev => [...prev, `Generated ${allRoutes.length} different routes from ${startingPub.name}`]);
-              } else {
-                for (let i = 0; i < maxToTest; i++) {
-                  const route = generateRouteForward(gPubs[i], closestEPub, pubs, 0);
-                  if (route) {
-                    route.distanceToHome = closestEDist;
-                    route.endPubName = closestEPub.name;
-                    route.startPubName = gPubs[i].name;
-                    allRoutes.push(route);
-                  }
-                  
-                  if (i % 10 === 0 && i > 0) {
-                    setDebugLog(prev => [...prev, `Processed ${i} starting points, found ${allRoutes.length} routes...`]);
-                  }
-                }
-              }
-              
-              if (allRoutes.length === 0) {
-                setStatusMessage('ERROR: Could not generate any valid routes!');
-                return;
-              }
-              
-              allRoutes.sort((a, b) => a.totalDistance - b.totalDistance);
-              
-              const topRoutes = allRoutes.slice(0, 10);
-              setRoutes(topRoutes);
-              
-              setDebugLog(prev => [...prev, 
-                `✅ Complete! All routes end at ${closestEPub.name} (${closestEDist.toFixed(2)}km from Oval)`,
-                `Shortest route: ${topRoutes[0].totalDistance.toFixed(2)}km from ${topRoutes[0].startPubName}`
-              ]);
-              setStatusMessage(`SUCCESS! Top ${topRoutes.length} routes, all ending at ${closestEPub.name}.`);
-            } catch (error) {
-              setStatusMessage(`ERROR: ${error.message}`);
-              setDebugLog(prev => [...prev, `Exception: ${error.message}`]);
-            }
-          };
-
-          const getSortedPubs = () => {
-            let filtered = filterLetter === 'all' 
-              ? pubs 
-              : pubs.filter(p => p.firstLetter === filterLetter);
-
-            return [...filtered].sort((a, b) => {
-              if (sortBy === 'letter') {
-                return a.firstLetter.localeCompare(b.firstLetter) || a.name.localeCompare(b.name);
-              } else {
-                return a.name.localeCompare(b.name);
-              }
-            });
-          };
-
-          const downloadCSV = () => {
-            const sorted = getSortedPubs();
-            const headers = ['Pub Name', 'First Letter', 'Latitude', 'Longitude', 'Address', 'City'];
-            const rows = sorted.map(pub => [
-              `"${pub.name}"`,
-              pub.firstLetter,
-              pub.lat,
-              pub.lon,
-              `"${pub.address}"`,
-              `"${pub.city}"`
-            ]);
-
-            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'pub-crawl-data.csv';
-            a.click();
-            window.URL.revokeObjectURL(url);
-          };
-
-          const downloadRouteCSV = (route, routeIndex) => {
-            const headers = ['Stop', 'Letter', 'Pub Name', 'Distance from Previous (km)', 'Latitude', 'Longitude', 'Address'];
-            const rows = route.route.map((stop, idx) => [
-              idx + 1,
-              stop.letter,
-              `"${stop.pub.name}"`,
-              stop.distance.toFixed(2),
-              stop.pub.lat,
-              stop.pub.lon,
-              `"${stop.pub.address}"`
-            ]);
-
-            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `route-${routeIndex + 1}.csv`;
-            a.click();
-            window.URL.revokeObjectURL(url);
-          };
-
-          const openInGoogleMaps = (route) => {
-            const stops = route.route.map(stop => 
-              `${stop.pub.lat},${stop.pub.lon}`
-            );
-            
-            if (stops.length > 10) {
-              alert(`Google Maps supports a maximum of 10 stops. This route has ${stops.length} stops. Opening first 10 stops only.`);
-            }
-            
-            const limitedStops = stops.slice(0, 10);
-            const mapsUrl = `https://www.google.com/maps/dir/${limitedStops.join('/')}`;
-            window.open(mapsUrl, '_blank');
-          };
-
-          const getLetterCounts = () => {
-            const counts = {};
-            pubs.forEach(pub => {
-              counts[pub.firstLetter] = (counts[pub.firstLetter] || 0) + 1;
-            });
-            return counts;
-          };
-
-          const letterCounts = getLetterCounts();
-          const sortedPubs = getSortedPubs();
-          const targetLetters = ['G', 'L', 'Y', 'P', 'H', 'G', 'O', 'O', 'S', 'E'];
-
-          // Lucide React icons as SVG
-          const MapPinIcon = () => (
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
-              <circle cx="12" cy="10" r="3"></circle>
+        // Lucide React icons as inline SVG components
+        const MapPin = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"></path>
+                <circle cx="12" cy="10" r="3"></circle>
             </svg>
-          );
+        );
 
-          const UploadIcon = () => (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="17 8 12 3 7 8"></polyline>
-              <line x1="12" y1="3" x2="12" y2="15"></line>
+        const Upload = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
             </svg>
-          );
+        );
 
-          const ZapIcon = () => (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+        const Download = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
             </svg>
-          );
+        );
 
-          const NavigationIcon = () => (
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
+        const Navigation = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
             </svg>
-          );
+        );
 
-          const DownloadIcon = () => (
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="7 10 12 15 17 10"></polyline>
-              <line x1="12" y1="15" x2="12" y2="3"></line>
+        const Zap = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
             </svg>
-          );
-
-          return (
-            <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 p-8">
-              <div className="max-w-6xl mx-auto">
-                <div className="bg-gray-800 rounded-lg shadow-2xl p-8 border border-gray-700">
-                  <h1 className="text-3xl font-bold text-amber-400 mb-2 flex items-center gap-2">
-                    <MapPinIcon />
-                    GLYPH & GOOSE Pub Crawl Planner
-                  </h1>
-                  <p className="text-gray-400 mb-6">Upload your pub data to plan your optimal pub crawl route</p>
-
-                  <div className="mb-6">
-                    <label className="flex items-center justify-center w-full px-4 py-6 bg-gray-700 border-2 border-dashed border-amber-600 rounded-lg cursor-pointer hover:bg-gray-600 transition">
-                      <UploadIcon />
-                      <span className="text-amber-400 font-medium ml-2">Upload GeoJSON File</span>
-                      <input type="file" accept=".json,.geojson" onChange={handleFileUpload} className="hidden" />
-                    </label>
-                  </div>
-
-                  {pubs.length > 0 && (
-                    <>
-                      <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
-                        <h3 className="font-semibold text-amber-400 mb-3">Starting Location Options:</h3>
-                        <div className="grid grid-cols-2 gap-4 mb-4">
-                          <div>
-                            <label className="block text-sm font-medium text-gray-300 mb-2">Choose Starting Area:</label>
-                            <select 
-                              value={startingArea} 
-                              onChange={(e) => {
-                                setStartingArea(e.target.value);
-                                setStartingPub(null);
-                              }}
-                              className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
-                            >
-                              <option value="any">Any Location</option>
-                              <option value="soho">Soho</option>
-                              <option value="coventGarden">Covent Garden</option>
-                              <option value="shoreditch">Shoreditch</option>
-                              <option value="camden">Camden</option>
-                              <option value="southBank">South Bank</option>
-                            </select>
-                          </div>
-                          
-                          <div>
-                            <label className="block text-sm font-medium text-gray-300 mb-2">Or Pick Specific Pub:</label>
-                            <select 
-                              value={startingPub ? startingPub.name : ''} 
-                              onChange={(e) => {
-                                const pub = pubs.find(p => p.name === e.target.value && p.firstLetter === 'G');
-                                setStartingPub(pub || null);
-                                if (pub) setStartingArea('any');
-                              }}
-                              className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
-                            >
-                              <option value="">Select a G pub...</option>
-                              {pubs.filter(p => p.firstLetter === 'G').sort((a, b) => a.name.localeCompare(b.name)).map((pub, idx) => (
-                                <option key={idx} value={pub.name}>{pub.name}</option>
-                              ))}
-                            </select>
-                          </div>
-                        </div>
-                        <p className="text-xs text-gray-400">
-                          {startingPub 
-                            ? `Routes will start from ${startingPub.name} and head towards Oval` 
-                            : startingArea !== 'any' 
-                              ? `Routes will start from ${startingArea} area and head towards Oval`
-                              : 'Routes will consider all possible starting points'}
-                        </p>
-                      </div>
-
-                      <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
-                        <h3 className="font-semibold text-amber-400 mb-3">Letters needed for "GLYPH & GOOSE":</h3>
-                        <div className="flex flex-wrap gap-3">
-                          {targetLetters.map((letter, idx) => {
-                            const count = letterCounts[letter] || 0;
-                            const needed = targetLetters.filter(l => l === letter).length;
-                            return (
-                              <div key={idx} className={`px-3 py-2 rounded ${count >= needed ? 'bg-green-900 border-green-600' : 'bg-red-900 border-red-600'} border`}>
-                                <span className="font-bold text-lg text-gray-100">{letter}</span>
-                                <span className="text-sm ml-2 text-gray-300">({count} found, {needed} needed)</span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      <div className="mb-6">
-                        <button 
-                          onClick={calculateOptimalRoutes}
-                          className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition flex items-center gap-2 font-semibold"
-                        >
-                          <ZapIcon />
-                          Generate Optimal Routes
-                        </button>
-                        
-                        {statusMessage && (
-                          <div className={`mt-4 p-3 rounded ${statusMessage.includes('ERROR') ? 'bg-red-900 border border-red-600' : 'bg-blue-900 border border-blue-600'}`}>
-                            <p className="text-sm text-gray-100">{statusMessage}</p>
-                          </div>
-                        )}
-                        
-                        {debugLog.length > 0 && (
-                          <div className="mt-4 p-3 rounded bg-gray-900 border border-gray-600 max-h-60 overflow-y-auto">
-                            <p className="text-xs font-bold text-amber-400 mb-2">Debug Log:</p>
-                            {debugLog.map((log, idx) => (
-                              <p key={idx} className="text-xs text-gray-300 font-mono">{log}</p>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-
-                      {routes.length > 0 && (
-                        <div className="mb-8">
-                          <h2 className="text-2xl font-bold text-amber-400 mb-4 flex items-center gap-2">
-                            <NavigationIcon />
-                            Top {routes.length} Routes
-                            {startingPub && <span className="text-sm text-gray-400">(from {startingPub.name})</span>}
-                            {!startingPub && startingArea !== 'any' && <span className="text-sm text-gray-400">(from {startingArea})</span>}
-                          </h2>
-                          {routes.map((route, idx) => (
-                            <div key={idx} className="mb-6 p-4 bg-gray-700 border-2 border-green-600 rounded-lg">
-                              <div className="flex justify-between items-center mb-3">
-                                <div>
-                                  <h3 className="text-xl font-semibold text-green-400">
-                                    Route {idx + 1} - {route.totalDistance.toFixed(2)} km ({(route.totalDistance * 0.621371).toFixed(2)} mi)
-                                  </h3>
-                                  <p className="text-sm text-gray-300 mt-1">
-                                    📍 {route.startPubName} → {route.endPubName}
-                                  </p>
-                                  <p className="text-xs text-green-300 mt-1">
-                                    Ending {route.distanceToHome.toFixed(2)} km from Oval
-                                  </p>
-                                </div>
-                                <div className="flex gap-2">
-                                  <button 
-                                    onClick={() => openInGoogleMaps(route)}
-                                    className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition flex items-center gap-2 text-sm"
-                                  >
-                                    <MapPinIcon />
-                                    Open in Maps
-                                  </button>
-                                  <button 
-                                    onClick={() => downloadRouteCSV(route, idx)}
-                                    className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition flex items-center gap-2 text-sm"
-                                  >
-                                    <DownloadIcon />
-                                    Download CSV
-                                  </button>
-                                </div>
-                              </div>
-                              <div className="space-y-2">
-                                {route.route.map((stop, stopIdx) => (
-                                  <div key={stopIdx} className="flex items-center gap-3 p-2 bg-gray-800 rounded border border-gray-600">
-                                    <div className="flex-shrink-0 w-8 h-8 bg-green-600 text-white rounded-full flex items-center justify-center font-bold text-sm">
-                                      {stopIdx + 1}
-                                    </div>
-                                    <div className="flex-shrink-0 w-8 h-8 bg-amber-500 text-white rounded flex items-center justify-center font-bold">
-                                      {stop.letter}
-                                    </div>
-                                    <div className="flex-grow">
-                                      <div className="font-semibold text-gray-100">{stop.pub.name}</div>
-                                      <div className="text-sm text-gray-400">{stop.pub.address}</div>
-                                    </div>
-                                    {stopIdx > 0 && (
-                                      <div className="text-sm text-green-400 font-mono">
-                                        +{stop.distance.toFixed(2)} km
-                                      </div>
-                                    )}
-                                    {stopIdx === route.route.length - 1 && (
-                                      <div className="text-xs text-blue-400">
-                                        🏠 Closest to Oval
-                                      </div>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      <div className="flex gap-4 mb-6 flex-wrap">
-                        <div>
-                          <label className="block text-sm font-medium text-gray-300 mb-1">Filter by Letter:</label>
-                          <select 
-                            value={filterLetter} 
-                            onChange={(e) => setFilterLetter(e.target.value)}
-                            className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100"
-                          >
-                            <option value="all">All Letters</option>
-                            {['G', 'L', 'Y', 'P', 'H', 'O', 'S', 'E'].map(letter => (
-                              <option key={letter} value={letter}>{letter} ({letterCounts[letter] || 0})</option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div>
-                          <label className="block text-sm font-medium text-gray-300 mb-1">Sort by:</label>
-                          <select 
-                            value={sortBy} 
-                            onChange={(e) => setSortBy(e.target.value)}
-                            className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100"
-                          >
-                            <option value="letter">Letter</option>
-                            <option value="name">Name</option>
-                          </select>
-                        </div>
-
-                        <div className="ml-auto">
-                          <label className="block text-sm font-medium text-gray-300 mb-1">&nbsp;</label>
-                          <button 
-                            onClick={downloadCSV}
-                            className="px-6 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition flex items-center gap-2"
-                          >
-                            <DownloadIcon />
-                            Download All Pubs CSV
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="overflow-x-auto rounded-lg border border-gray-700">
-                        <table className="w-full border-collapse">
-                          <thead>
-                            <tr className="bg-gray-700">
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Letter</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Pub Name</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Latitude</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Longitude</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Address</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {sortedPubs.map((pub, idx) => (
-                              <tr key={idx} className="hover:bg-gray-700 transition">
-                                <td className="border border-gray-600 px-4 py-2 font-bold text-amber-500">{pub.firstLetter}</td>
-                                <td className="border border-gray-600 px-4 py-2 text-gray-200">{pub.name}</td>
-                                <td className="border border-gray-600 px-4 py-2 font-mono text-sm text-gray-300">{pub.lat}</td>
-                                <td className="border border-gray-600 px-4 py-2 font-mono text-sm text-gray-300">{pub.lon}</td>
-                                <td className="border border-gray-600 px-4 py-2 text-sm text-gray-400">{pub.address}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <p className="mt-4 text-gray-400 text-sm">Total pubs found: {sortedPubs.length}</p>
-                    </>
-                  )}
-
-                  {pubs.length === 0 && (
-                    <div className="text-center py-12 text-gray-500">
-                      <MapPinIcon />
-                      <p className="mt-4">Upload a GeoJSON file to get started!</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          );
-        }
-
-        ReactDOM.render(<PubCrawlPlanner />, document.getElementById('root'));
-    </script>
-</body>
-</html><!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GLYPH & GOOSE Pub Crawl Planner</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body>
-    <div id="root"></div>
-    
-    <script type="text/babel">
-        const { useState } = React;
+        );
 
         function PubCrawlPlanner() {
-          const [pubs, setPubs] = useState([]);
-          const [sortBy, setSortBy] = useState('letter');
-          const [filterLetter, setFilterLetter] = useState('all');
-          const [routes, setRoutes] = useState([]);
-          const [statusMessage, setStatusMessage] = useState('');
-          const [debugLog, setDebugLog] = useState([]);
-          const [homeLocation, setHomeLocation] = useState({ lat: 51.4817, lon: -0.1130 });
-          const [startingArea, setStartingArea] = useState('any');
-          const [startingPub, setStartingPub] = useState(null);
+            const [pubs, setPubs] = useState([]);
+            const [sortBy, setSortBy] = useState('letter');
+            const [filterLetter, setFilterLetter] = useState('all');
+            const [routes, setRoutes] = useState([]);
+            const [statusMessage, setStatusMessage] = useState('');
+            const [debugLog, setDebugLog] = useState([]);
+            const [homeLocation] = useState({ lat: 51.4817, lon: -0.1130 });
+            const [startingArea, setStartingArea] = useState('any');
+            const [startingPub, setStartingPub] = useState(null);
+            const [mustVisitPubs, setMustVisitPubs] = useState([]);
 
-          const getFirstLetter = (name) => {
-            const cleanName = name.replace(/^the\s+/i, '');
-            return cleanName.charAt(0).toUpperCase();
-          };
-
-          const processGeoJSON = (geojson) => {
-            const features = geojson.features || [];
-            const processed = [];
-
-            features.forEach(feature => {
-              const props = feature.properties || {};
-              const geometry = feature.geometry;
-              
-              if (props.amenity === 'pub' && props.name && geometry) {
-                const firstLetter = getFirstLetter(props.name);
-                
-                if (['G', 'L', 'Y', 'P', 'H', 'O', 'S', 'E'].includes(firstLetter)) {
-                  let lat, lon;
-                  
-                  if (geometry.type === 'Point') {
-                    lon = geometry.coordinates[0];
-                    lat = geometry.coordinates[1];
-                  } else if (geometry.type === 'Polygon' || geometry.type === 'LineString') {
-                    const coords = geometry.type === 'Polygon' ? geometry.coordinates[0] : geometry.coordinates;
-                    let sumLat = 0, sumLon = 0;
-                    coords.forEach(coord => {
-                      sumLon += coord[0];
-                      sumLat += coord[1];
-                    });
-                    lon = sumLon / coords.length;
-                    lat = sumLat / coords.length;
-                  } else {
-                    return;
-                  }
-                  
-                  if (lat != null && lon != null && !isNaN(lat) && !isNaN(lon)) {
-                    processed.push({
-                      name: props.name,
-                      firstLetter: firstLetter,
-                      lat: lat,
-                      lon: lon,
-                      address: props['addr:street'] || 'N/A',
-                      city: props['addr:city'] || 'N/A'
-                    });
-                  }
-                }
-              }
-            });
-
-            return processed;
-          };
-
-          const handleFileUpload = (event) => {
-            const file = event.target.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = (e) => {
-              try {
-                const geojson = JSON.parse(e.target.result);
-                const processed = processGeoJSON(geojson);
-                setPubs(processed);
-                setRoutes([]);
-                setStatusMessage(`Loaded ${processed.length} pubs`);
-                setDebugLog([]);
-              } catch (error) {
-                alert('Error parsing GeoJSON file: ' + error.message);
-              }
+            const getFirstLetter = (name) => {
+                const cleanName = name.replace(/^the\s+/i, '');
+                return cleanName.charAt(0).toUpperCase();
             };
-            reader.readAsText(file);
-          };
 
-          const calculateDistance = (lat1, lon1, lat2, lon2) => {
-            if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) {
-              return NaN;
-            }
-            if (typeof lat1 !== 'number' || typeof lon1 !== 'number' || 
-                typeof lat2 !== 'number' || typeof lon2 !== 'number') {
-              return NaN;
-            }
-            
-            const R = 6371;
-            const dLat = (lat2 - lat1) * Math.PI / 180;
-            const dLon = (lon2 - lon1) * Math.PI / 180;
-            const a = 
-              Math.sin(dLat/2) * Math.sin(dLat/2) +
-              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-              Math.sin(dLon/2) * Math.sin(dLon/2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-            return R * c;
-          };
+            const calculateDistance = (lat1, lon1, lat2, lon2) => {
+                if (lat1 == null || lon1 == null || lat2 == null || lon2 == null) return NaN;
+                if (typeof lat1 !== 'number' || typeof lon1 !== 'number' || 
+                    typeof lat2 !== 'number' || typeof lon2 !== 'number') return NaN;
+                
+                const R = 6371;
+                const dLat = (lat2 - lat1) * Math.PI / 180;
+                const dLon = (lon2 - lon1) * Math.PI / 180;
+                const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                    Math.sin(dLon/2) * Math.sin(dLon/2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                return R * c;
+            };
 
-          const generateRouteForward = (startPub, endPub, allPubs, variation = 0) => {
-            const sequence = ['G', 'L', 'Y', 'P', 'H', 'G', 'O', 'O', 'S', 'E'];
-            const route = [{ pub: startPub, distance: 0, letter: 'G' }];
-            const usedPubIds = new Set([startPub.name + startPub.lat]);
-            
-            let currentLat = startPub.lat;
-            let currentLon = startPub.lon;
-            let totalDistance = 0;
-
-            for (let i = 1; i < sequence.length; i++) {
-              const targetLetter = sequence[i];
-              
-              if (i === sequence.length - 1) {
-                const finalDist = calculateDistance(currentLat, currentLon, endPub.lat, endPub.lon);
-                route.push({
-                  pub: endPub,
-                  distance: finalDist,
-                  letter: 'E'
-                });
-                totalDistance += finalDist;
-                break;
-              }
-              
-              const candidates = allPubs.filter(p => 
-                p.firstLetter === targetLetter && 
-                !usedPubIds.has(p.name + p.lat) &&
-                p.lat != null &&
-                p.lon != null
-              );
-              
-              if (candidates.length === 0) return null;
-              
-              const scoredCandidates = [];
-              
-              for (const pub of candidates) {
-                const pubLat = typeof pub.lat === 'number' ? pub.lat : parseFloat(pub.lat);
-                const pubLon = typeof pub.lon === 'number' ? pub.lon : parseFloat(pub.lon);
+            const getAreaName = (pub) => {
+                const lat = pub.lat;
+                const lon = pub.lon;
                 
-                if (isNaN(pubLat) || isNaN(pubLon)) continue;
-                
-                const distFromCurrent = calculateDistance(currentLat, currentLon, pubLat, pubLon);
-                const distToEnd = calculateDistance(pubLat, pubLon, endPub.lat, endPub.lon);
-                
-                if (isNaN(distFromCurrent) || isNaN(distToEnd)) continue;
-                
-                let score;
-                
-                if (i === sequence.length - 2) {
-                  if (distToEnd > 1.0) {
-                    const penalty = (distToEnd - 1.0) * 5;
-                    score = (distFromCurrent * 0.3) + (distToEnd * 0.7) + penalty;
-                  } else {
-                    score = (distFromCurrent * 0.4) + (distToEnd * 0.6);
-                  }
-                } else {
-                  const progressWeight = 0.3 + (i / sequence.length * 0.3);
-                  const nearWeight = 1 - progressWeight;
-                  score = (distFromCurrent * nearWeight) + (distToEnd * progressWeight);
-                }
-                
-                scoredCandidates.push({ pub, score });
-              }
-              
-              if (scoredCandidates.length === 0) return null;
-              
-              scoredCandidates.sort((a, b) => a.score - b.score);
-              
-              let selectedPub;
-              if (variation === 0) {
-                selectedPub = scoredCandidates[0].pub;
-              } else {
-                const topN = Math.min(5, scoredCandidates.length);
-                const index = (variation - 1) % topN;
-                selectedPub = scoredCandidates[index].pub;
-              }
-              
-              const stepDist = calculateDistance(currentLat, currentLon, selectedPub.lat, selectedPub.lon);
-              
-              route.push({
-                pub: selectedPub,
-                distance: stepDist,
-                letter: targetLetter
-              });
-              
-              usedPubIds.add(selectedPub.name + selectedPub.lat);
-              currentLat = selectedPub.lat;
-              currentLon = selectedPub.lon;
-              totalDistance += stepDist;
-            }
-
-            return { route, totalDistance };
-          };
-
-          const calculateOptimalRoutes = () => {
-            try {
-              setStatusMessage('Starting calculation...');
-              setDebugLog([]);
-              
-              const ePubs = pubs.filter(p => p.firstLetter === 'E');
-              
-              if (ePubs.length === 0) {
-                setStatusMessage('ERROR: No pubs starting with E found!');
-                return;
-              }
-              
-              ePubs.sort((a, b) => {
-                const distA = calculateDistance(a.lat, a.lon, homeLocation.lat, homeLocation.lon);
-                const distB = calculateDistance(b.lat, b.lon, homeLocation.lat, homeLocation.lon);
-                return distA - distB;
-              });
-              
-              const closestEPub = ePubs[0];
-              const closestEDist = calculateDistance(closestEPub.lat, closestEPub.lon, homeLocation.lat, homeLocation.lon);
-              
-              setStatusMessage(`Found ${ePubs.length} E pubs. Using closest to Oval as endpoint...`);
-              setDebugLog([
-                `Closest E pub to Oval: ${closestEPub.name} (${closestEDist.toFixed(2)}km away)`,
-                `All routes will end at this pub`
-              ]);
-              
-              const letterCounts = {};
-              pubs.forEach(p => {
-                letterCounts[p.firstLetter] = (letterCounts[p.firstLetter] || 0) + 1;
-              });
-              
-              const needed = { G: 2, L: 1, Y: 1, P: 1, H: 1, O: 2, S: 1, E: 1 };
-              const missing = [];
-              for (const [letter, count] of Object.entries(needed)) {
-                if (!letterCounts[letter] || letterCounts[letter] < count) {
-                  missing.push(`${letter} (need ${count}, have ${letterCounts[letter] || 0})`);
-                }
-              }
-              
-              if (missing.length > 0) {
-                setStatusMessage(`ERROR: Missing letters: ${missing.join(', ')}`);
-                return;
-              }
-              
-              let gPubs = pubs.filter(p => p.firstLetter === 'G');
-              
-              if (startingPub) {
-                gPubs = [startingPub];
-                setStatusMessage(`Finding routes from ${startingPub.name} to ${closestEPub.name}...`);
-                setDebugLog(prev => [...prev, `Generating multiple route variations from ${startingPub.name}...`]);
-              } else if (startingArea !== 'any') {
-                const areaCoords = {
-                  soho: { lat: 51.5136, lon: -0.1358 },
-                  coventGarden: { lat: 51.5117, lon: -0.1232 },
-                  shoreditch: { lat: 51.5251, lon: -0.0823 },
-                  camden: { lat: 51.5392, lon: -0.1426 },
-                  southBank: { lat: 51.5074, lon: -0.1198 }
+                const areas = {
+                    soho: { lat: 51.5136, lon: -0.1358, name: 'Soho' },
+                    coventGarden: { lat: 51.5117, lon: -0.1232, name: 'Covent Garden' },
+                    westEnd: { lat: 51.5144, lon: -0.1419, name: 'West End' },
+                    fitzrovia: { lat: 51.5211, lon: -0.1390, name: 'Fitzrovia' },
+                    holborn: { lat: 51.5174, lon: -0.1203, name: 'Holborn' },
+                    clerkenwell: { lat: 51.5237, lon: -0.1039, name: 'Clerkenwell' },
+                    camden: { lat: 51.5392, lon: -0.1426, name: 'Camden' },
+                    islington: { lat: 51.5416, lon: -0.1030, name: 'Islington' },
+                    kingsCross: { lat: 51.5308, lon: -0.1238, name: "King's Cross" },
+                    hampstead: { lat: 51.5556, lon: -0.1778, name: 'Hampstead' },
+                    highgate: { lat: 51.5717, lon: -0.1467, name: 'Highgate' },
+                    kentishTown: { lat: 51.5507, lon: -0.1405, name: 'Kentish Town' },
+                    shoreditch: { lat: 51.5251, lon: -0.0823, name: 'Shoreditch' },
+                    hackney: { lat: 51.5450, lon: -0.0553, name: 'Hackney' },
+                    dalston: { lat: 51.5478, lon: -0.0754, name: 'Dalston' },
+                    bethnal: { lat: 51.5273, lon: -0.0552, name: 'Bethnal Green' },
+                    spitalfields: { lat: 51.5189, lon: -0.0749, name: 'Spitalfields' },
+                    canaryWharf: { lat: 51.5054, lon: -0.0235, name: 'Canary Wharf' },
+                    stratford: { lat: 51.5416, lon: -0.0042, name: 'Stratford' },
+                    notting: { lat: 51.5095, lon: -0.1957, name: 'Notting Hill' },
+                    portobello: { lat: 51.5153, lon: -0.2058, name: 'Portobello' },
+                    kensington: { lat: 51.4990, lon: -0.1938, name: 'Kensington' },
+                    chelsea: { lat: 51.4875, lon: -0.1687, name: 'Chelsea' },
+                    fulham: { lat: 51.4822, lon: -0.1950, name: 'Fulham' },
+                    hammersmith: { lat: 51.4927, lon: -0.2339, name: 'Hammersmith' },
+                    shepherdsBush: { lat: 51.5074, lon: -0.2239, name: "Shepherd's Bush" },
+                    southBank: { lat: 51.5074, lon: -0.1198, name: 'South Bank' },
+                    borough: { lat: 51.5005, lon: -0.0909, name: 'Borough' },
+                    bermondsey: { lat: 51.4978, lon: -0.0637, name: 'Bermondsey' },
+                    peckham: { lat: 51.4739, lon: -0.0692, name: 'Peckham' },
+                    brixton: { lat: 51.4613, lon: -0.1157, name: 'Brixton' },
+                    clapham: { lat: 51.4618, lon: -0.1384, name: 'Clapham' },
+                    balham: { lat: 51.4431, lon: -0.1527, name: 'Balham' },
+                    stockwell: { lat: 51.4721, lon: -0.1230, name: 'Stockwell' },
+                    camberwell: { lat: 51.4741, lon: -0.0910, name: 'Camberwell' },
+                    dulwich: { lat: 51.4446, lon: -0.0861, name: 'Dulwich' },
+                    greenwich: { lat: 51.4825, lon: 0.0091, name: 'Greenwich' },
+                    oval: { lat: 51.4817, lon: -0.1130, name: 'Oval' },
+                    kennington: { lat: 51.4884, lon: -0.1053, name: 'Kennington' },
+                    newCross: { lat: 51.4760, lon: -0.0324, name: 'New Cross' },
+                    deptford: { lat: 51.4784, lon: -0.0265, name: 'Deptford' },
+                    lewisham: { lat: 51.4654, lon: -0.0145, name: 'Lewisham' },
+                    catford: { lat: 51.4446, lon: -0.0208, name: 'Catford' },
+                    wimbledon: { lat: 51.4214, lon: -0.2063, name: 'Wimbledon' },
+                    putney: { lat: 51.4618, lon: -0.2155, name: 'Putney' },
+                    wandsworth: { lat: 51.4571, lon: -0.1910, name: 'Wandsworth' },
+                    tooting: { lat: 51.4275, lon: -0.1687, name: 'Tooting' },
+                    streatham: { lat: 51.4318, lon: -0.1255, name: 'Streatham' },
+                    mayfair: { lat: 51.5085, lon: -0.1437, name: 'Mayfair' },
+                    marylebone: { lat: 51.5225, lon: -0.1551, name: 'Marylebone' },
+                    bloomsbury: { lat: 51.5215, lon: -0.1265, name: 'Bloomsbury' },
+                    cityOfLondon: { lat: 51.5155, lon: -0.0922, name: 'City of London' }
                 };
                 
-                const areaCenter = areaCoords[startingArea];
-                if (areaCenter) {
-                  gPubs = gPubs.filter(g => {
-                    const dist = calculateDistance(g.lat, g.lon, areaCenter.lat, areaCenter.lon);
-                    return dist <= 1.5;
-                  }).sort((a, b) => {
-                    const distA = calculateDistance(a.lat, a.lon, areaCenter.lat, areaCenter.lon);
-                    const distB = calculateDistance(b.lat, b.lon, areaCenter.lat, areaCenter.lon);
-                    return distA - distB;
-                  });
-                  
-                  setStatusMessage(`Finding routes from ${startingArea} to ${closestEPub.name}...`);
-                  setDebugLog(prev => [...prev, `Found ${gPubs.length} G pubs in ${startingArea}`]);
+                let closestArea = 'London';
+                let minDistance = Infinity;
+                
+                for (const area of Object.values(areas)) {
+                    const dist = calculateDistance(lat, lon, area.lat, area.lon);
+                    if (dist < minDistance) {
+                        minDistance = dist;
+                        closestArea = area.name;
+                    }
                 }
-              } else {
-                setStatusMessage(`Finding best routes ending at ${closestEPub.name}...`);
-              }
-              
-              if (gPubs.length === 0) {
-                setStatusMessage('ERROR: No suitable starting pubs found in selected area!');
-                return;
-              }
-              
-              const allRoutes = [];
-              const maxToTest = startingPub ? 1 : Math.min(30, gPubs.length);
-              
-              setDebugLog(prev => [...prev, `Testing ${maxToTest} starting points (routes will move towards Oval)...`]);
-              
-              if (startingPub) {
-                for (let v = 0; v < 20; v++) {
-                  const route = generateRouteForward(startingPub, closestEPub, pubs, v);
-                  if (route) {
-                    route.distanceToHome = closestEDist;
-                    route.endPubName = closestEPub.name;
-                    route.startPubName = startingPub.name;
-                    route.variation = v;
-                    allRoutes.push(route);
-                  }
-                }
-                setDebugLog(prev => [...prev, `Generated ${allRoutes.length} different routes from ${startingPub.name}`]);
-              } else {
-                for (let i = 0; i < maxToTest; i++) {
-                  const route = generateRouteForward(gPubs[i], closestEPub, pubs, 0);
-                  if (route) {
-                    route.distanceToHome = closestEDist;
-                    route.endPubName = closestEPub.name;
-                    route.startPubName = gPubs[i].name;
-                    allRoutes.push(route);
-                  }
-                  
-                  if (i % 10 === 0 && i > 0) {
-                    setDebugLog(prev => [...prev, `Processed ${i} starting points, found ${allRoutes.length} routes...`]);
-                  }
-                }
-              }
-              
-              if (allRoutes.length === 0) {
-                setStatusMessage('ERROR: Could not generate any valid routes!');
-                return;
-              }
-              
-              allRoutes.sort((a, b) => a.totalDistance - b.totalDistance);
-              
-              const topRoutes = allRoutes.slice(0, 10);
-              setRoutes(topRoutes);
-              
-              setDebugLog(prev => [...prev, 
-                `✅ Complete! All routes end at ${closestEPub.name} (${closestEDist.toFixed(2)}km from Oval)`,
-                `Shortest route: ${topRoutes[0].totalDistance.toFixed(2)}km from ${topRoutes[0].startPubName}`
-              ]);
-              setStatusMessage(`SUCCESS! Top ${topRoutes.length} routes, all ending at ${closestEPub.name}.`);
-            } catch (error) {
-              setStatusMessage(`ERROR: ${error.message}`);
-              setDebugLog(prev => [...prev, `Exception: ${error.message}`]);
-            }
-          };
+                
+                return closestArea;
+            };
 
-          const getSortedPubs = () => {
-            let filtered = filterLetter === 'all' 
-              ? pubs 
-              : pubs.filter(p => p.firstLetter === filterLetter);
+            const processGeoJSON = (geojson) => {
+                const features = geojson.features || [];
+                const processed = [];
 
-            return [...filtered].sort((a, b) => {
-              if (sortBy === 'letter') {
-                return a.firstLetter.localeCompare(b.firstLetter) || a.name.localeCompare(b.name);
-              } else {
-                return a.name.localeCompare(b.name);
-              }
-            });
-          };
-
-          const downloadCSV = () => {
-            const sorted = getSortedPubs();
-            const headers = ['Pub Name', 'First Letter', 'Latitude', 'Longitude', 'Address', 'City'];
-            const rows = sorted.map(pub => [
-              `"${pub.name}"`,
-              pub.firstLetter,
-              pub.lat,
-              pub.lon,
-              `"${pub.address}"`,
-              `"${pub.city}"`
-            ]);
-
-            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'pub-crawl-data.csv';
-            a.click();
-            window.URL.revokeObjectURL(url);
-          };
-
-          const downloadRouteCSV = (route, routeIndex) => {
-            const headers = ['Stop', 'Letter', 'Pub Name', 'Distance from Previous (km)', 'Latitude', 'Longitude', 'Address'];
-            const rows = route.route.map((stop, idx) => [
-              idx + 1,
-              stop.letter,
-              `"${stop.pub.name}"`,
-              stop.distance.toFixed(2),
-              stop.pub.lat,
-              stop.pub.lon,
-              `"${stop.pub.address}"`
-            ]);
-
-            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-            const blob = new Blob([csv], { type: 'text/csv' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `route-${routeIndex + 1}.csv`;
-            a.click();
-            window.URL.revokeObjectURL(url);
-          };
-
-          const openInGoogleMaps = (route) => {
-            const stops = route.route.map(stop => 
-              `${stop.pub.lat},${stop.pub.lon}`
-            );
-            
-            if (stops.length > 10) {
-              alert(`Google Maps supports a maximum of 10 stops. This route has ${stops.length} stops. Opening first 10 stops only.`);
-            }
-            
-            const limitedStops = stops.slice(0, 10);
-            const mapsUrl = `https://www.google.com/maps/dir/${limitedStops.join('/')}`;
-            window.open(mapsUrl, '_blank');
-          };
-
-          const getLetterCounts = () => {
-            const counts = {};
-            pubs.forEach(pub => {
-              counts[pub.firstLetter] = (counts[pub.firstLetter] || 0) + 1;
-            });
-            return counts;
-          };
-
-          const letterCounts = getLetterCounts();
-          const sortedPubs = getSortedPubs();
-          const targetLetters = ['G', 'L', 'Y', 'P', 'H', 'G', 'O', 'O', 'S', 'E'];
-
-          // Lucide React icons as SVG
-          const MapPinIcon = () => (
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
-              <circle cx="12" cy="10" r="3"></circle>
-            </svg>
-          );
-
-          const UploadIcon = () => (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="17 8 12 3 7 8"></polyline>
-              <line x1="12" y1="3" x2="12" y2="15"></line>
-            </svg>
-          );
-
-          const ZapIcon = () => (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-            </svg>
-          );
-
-          const NavigationIcon = () => (
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
-            </svg>
-          );
-
-          const DownloadIcon = () => (
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="7 10 12 15 17 10"></polyline>
-              <line x1="12" y1="15" x2="12" y2="3"></line>
-            </svg>
-          );
-
-          return (
-            <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 p-8">
-              <div className="max-w-6xl mx-auto">
-                <div className="bg-gray-800 rounded-lg shadow-2xl p-8 border border-gray-700">
-                  <h1 className="text-3xl font-bold text-amber-400 mb-2 flex items-center gap-2">
-                    <MapPinIcon />
-                    GLYPH & GOOSE Pub Crawl Planner
-                  </h1>
-                  <p className="text-gray-400 mb-6">Upload your pub data to plan your optimal pub crawl route</p>
-
-                  <div className="mb-6">
-                    <label className="flex items-center justify-center w-full px-4 py-6 bg-gray-700 border-2 border-dashed border-amber-600 rounded-lg cursor-pointer hover:bg-gray-600 transition">
-                      <UploadIcon />
-                      <span className="text-amber-400 font-medium ml-2">Upload GeoJSON File</span>
-                      <input type="file" accept=".json,.geojson" onChange={handleFileUpload} className="hidden" />
-                    </label>
-                  </div>
-
-                  {pubs.length > 0 && (
-                    <>
-                      <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
-                        <h3 className="font-semibold text-amber-400 mb-3">Starting Location Options:</h3>
-                        <div className="grid grid-cols-2 gap-4 mb-4">
-                          <div>
-                            <label className="block text-sm font-medium text-gray-300 mb-2">Choose Starting Area:</label>
-                            <select 
-                              value={startingArea} 
-                              onChange={(e) => {
-                                setStartingArea(e.target.value);
-                                setStartingPub(null);
-                              }}
-                              className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
-                            >
-                              <option value="any">Any Location</option>
-                              <option value="soho">Soho</option>
-                              <option value="coventGarden">Covent Garden</option>
-                              <option value="shoreditch">Shoreditch</option>
-                              <option value="camden">Camden</option>
-                              <option value="southBank">South Bank</option>
-                            </select>
-                          </div>
-                          
-                          <div>
-                            <label className="block text-sm font-medium text-gray-300 mb-2">Or Pick Specific Pub:</label>
-                            <select 
-                              value={startingPub ? startingPub.name : ''} 
-                              onChange={(e) => {
-                                const pub = pubs.find(p => p.name === e.target.value && p.firstLetter === 'G');
-                                setStartingPub(pub || null);
-                                if (pub) setStartingArea('any');
-                              }}
-                              className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
-                            >
-                              <option value="">Select a G pub...</option>
-                              {pubs.filter(p => p.firstLetter === 'G').sort((a, b) => a.name.localeCompare(b.name)).map((pub, idx) => (
-                                <option key={idx} value={pub.name}>{pub.name}</option>
-                              ))}
-                            </select>
-                          </div>
-                        </div>
-                        <p className="text-xs text-gray-400">
-                          {startingPub 
-                            ? `Routes will start from ${startingPub.name} and head towards Oval` 
-                            : startingArea !== 'any' 
-                              ? `Routes will start from ${startingArea} area and head towards Oval`
-                              : 'Routes will consider all possible starting points'}
-                        </p>
-                      </div>
-
-                      <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
-                        <h3 className="font-semibold text-amber-400 mb-3">Letters needed for "GLYPH & GOOSE":</h3>
-                        <div className="flex flex-wrap gap-3">
-                          {targetLetters.map((letter, idx) => {
-                            const count = letterCounts[letter] || 0;
-                            const needed = targetLetters.filter(l => l === letter).length;
-                            return (
-                              <div key={idx} className={`px-3 py-2 rounded ${count >= needed ? 'bg-green-900 border-green-600' : 'bg-red-900 border-red-600'} border`}>
-                                <span className="font-bold text-lg text-gray-100">{letter}</span>
-                                <span className="text-sm ml-2 text-gray-300">({count} found, {needed} needed)</span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      <div className="mb-6">
-                        <button 
-                          onClick={calculateOptimalRoutes}
-                          className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition flex items-center gap-2 font-semibold"
-                        >
-                          <ZapIcon />
-                          Generate Optimal Routes
-                        </button>
+                features.forEach(feature => {
+                    const props = feature.properties || {};
+                    const geometry = feature.geometry;
+                    
+                    if (props.amenity === 'pub' && props.name && geometry) {
+                        const firstLetter = getFirstLetter(props.name);
                         
-                        {statusMessage && (
-                          <div className={`mt-4 p-3 rounded ${statusMessage.includes('ERROR') ? 'bg-red-900 border border-red-600' : 'bg-blue-900 border border-blue-600'}`}>
-                            <p className="text-sm text-gray-100">{statusMessage}</p>
-                          </div>
-                        )}
-                        
-                        {debugLog.length > 0 && (
-                          <div className="mt-4 p-3 rounded bg-gray-900 border border-gray-600 max-h-60 overflow-y-auto">
-                            <p className="text-xs font-bold text-amber-400 mb-2">Debug Log:</p>
-                            {debugLog.map((log, idx) => (
-                              <p key={idx} className="text-xs text-gray-300 font-mono">{log}</p>
-                            ))}
-                          </div>
-                        )}
-                      </div>
+                        if (['G', 'L', 'Y', 'P', 'H', 'O', 'S', 'E'].includes(firstLetter)) {
+                            let lat, lon;
+                            
+                            if (geometry.type === 'Point') {
+                                lon = geometry.coordinates[0];
+                                lat = geometry.coordinates[1];
+                            } else if (geometry.type === 'Polygon' || geometry.type === 'LineString') {
+                                const coords = geometry.type === 'Polygon' ? geometry.coordinates[0] : geometry.coordinates;
+                                let sumLat = 0, sumLon = 0;
+                                coords.forEach(coord => {
+                                    sumLon += coord[0];
+                                    sumLat += coord[1];
+                                });
+                                lon = sumLon / coords.length;
+                                lat = sumLat / coords.length;
+                            } else {
+                                return;
+                            }
+                            
+                            if (lat != null && lon != null && !isNaN(lat) && !isNaN(lon)) {
+                                processed.push({
+                                    name: props.name,
+                                    firstLetter: firstLetter,
+                                    lat: lat,
+                                    lon: lon,
+                                    address: props['addr:street'] || 'N/A',
+                                    city: props['addr:city'] || 'N/A'
+                                });
+                            }
+                        }
+                    }
+                });
 
-                      {routes.length > 0 && (
-                        <div className="mb-8">
-                          <h2 className="text-2xl font-bold text-amber-400 mb-4 flex items-center gap-2">
-                            <NavigationIcon />
-                            Top {routes.length} Routes
-                            {startingPub && <span className="text-sm text-gray-400">(from {startingPub.name})</span>}
-                            {!startingPub && startingArea !== 'any' && <span className="text-sm text-gray-400">(from {startingArea})</span>}
-                          </h2>
-                          {routes.map((route, idx) => (
-                            <div key={idx} className="mb-6 p-4 bg-gray-700 border-2 border-green-600 rounded-lg">
-                              <div className="flex justify-between items-center mb-3">
-                                <div>
-                                  <h3 className="text-xl font-semibold text-green-400">
-                                    Route {idx + 1} - {route.totalDistance.toFixed(2)} km ({(route.totalDistance * 0.621371).toFixed(2)} mi)
-                                  </h3>
-                                  <p className="text-sm text-gray-300 mt-1">
-                                    📍 {route.startPubName} → {route.endPubName}
-                                  </p>
-                                  <p className="text-xs text-green-300 mt-1">
-                                    Ending {route.distanceToHome.toFixed(2)} km from Oval
-                                  </p>
-                                </div>
-                                <div className="flex gap-2">
-                                  <button 
-                                    onClick={() => openInGoogleMaps(route)}
-                                    className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition flex items-center gap-2 text-sm"
-                                  >
-                                    <MapPinIcon />
-                                    Open in Maps
-                                  </button>
-                                  <button 
-                                    onClick={() => downloadRouteCSV(route, idx)}
-                                    className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition flex items-center gap-2 text-sm"
-                                  >
-                                    <DownloadIcon />
-                                    Download CSV
-                                  </button>
-                                </div>
-                              </div>
-                              <div className="space-y-2">
-                                {route.route.map((stop, stopIdx) => (
-                                  <div key={stopIdx} className="flex items-center gap-3 p-2 bg-gray-800 rounded border border-gray-600">
-                                    <div className="flex-shrink-0 w-8 h-8 bg-green-600 text-white rounded-full flex items-center justify-center font-bold text-sm">
-                                      {stopIdx + 1}
-                                    </div>
-                                    <div className="flex-shrink-0 w-8 h-8 bg-amber-500 text-white rounded flex items-center justify-center font-bold">
-                                      {stop.letter}
-                                    </div>
-                                    <div className="flex-grow">
-                                      <div className="font-semibold text-gray-100">{stop.pub.name}</div>
-                                      <div className="text-sm text-gray-400">{stop.pub.address}</div>
-                                    </div>
-                                    {stopIdx > 0 && (
-                                      <div className="text-sm text-green-400 font-mono">
-                                        +{stop.distance.toFixed(2)} km
-                                      </div>
-                                    )}
-                                    {stopIdx === route.route.length - 1 && (
-                                      <div className="text-xs text-blue-400">
-                                        🏠 Closest to Oval
-                                      </div>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
+                return processed;
+            };
+
+            const handleFileUpload = (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const geojson = JSON.parse(e.target.result);
+                        const processed = processGeoJSON(geojson);
+                        setPubs(processed);
+                        setRoutes([]);
+                        setStatusMessage(`Loaded ${processed.length} pubs`);
+                        setDebugLog([]);
+                    } catch (error) {
+                        alert('Error parsing GeoJSON file: ' + error.message);
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            const generateRouteForward = (startPub, endPub, allPubs, variation = 0, mustVisit = []) => {
+                const sequence = ['G', 'L', 'Y', 'P', 'H', 'G', 'O', 'O', 'S', 'E'];
+                const route = [{ pub: startPub, distance: 0, letter: 'G' }];
+                const usedPubIds = new Set([startPub.name + startPub.lat]);
+                
+                let currentLat = startPub.lat;
+                let currentLon = startPub.lon;
+                let totalDistance = 0;
+
+                for (let i = 1; i < sequence.length; i++) {
+                    const targetLetter = sequence[i];
+                    
+                    if (i === sequence.length - 1) {
+                        const finalDist = calculateDistance(currentLat, currentLon, endPub.lat, endPub.lon);
+                        route.push({ pub: endPub, distance: finalDist, letter: 'E' });
+                        totalDistance += finalDist;
+                        break;
+                    }
+                    
+                    const mustVisitForLetter = mustVisit.find(mv => 
+                        mv.firstLetter === targetLetter && !usedPubIds.has(mv.name + mv.lat)
+                    );
+                    
+                    if (mustVisitForLetter) {
+                        const stepDist = calculateDistance(currentLat, currentLon, mustVisitForLetter.lat, mustVisitForLetter.lon);
+                        route.push({ pub: mustVisitForLetter, distance: stepDist, letter: targetLetter });
+                        usedPubIds.add(mustVisitForLetter.name + mustVisitForLetter.lat);
+                        currentLat = mustVisitForLetter.lat;
+                        currentLon = mustVisitForLetter.lon;
+                        totalDistance += stepDist;
+                        continue;
+                    }
+                    
+                    const candidates = allPubs.filter(p => 
+                        p.firstLetter === targetLetter && 
+                        !usedPubIds.has(p.name + p.lat) &&
+                        p.lat != null && p.lon != null
+                    );
+                    
+                    if (candidates.length === 0) return null;
+                    
+                    const scoredCandidates = [];
+                    
+                    for (const pub of candidates) {
+                        const pubLat = typeof pub.lat === 'number' ? pub.lat : parseFloat(pub.lat);
+                        const pubLon = typeof pub.lon === 'number' ? pub.lon : parseFloat(pub.lon);
+                        
+                        if (isNaN(pubLat) || isNaN(pubLon)) continue;
+                        
+                        const distFromCurrent = calculateDistance(currentLat, currentLon, pubLat, pubLon);
+                        const distToEnd = calculateDistance(pubLat, pubLon, endPub.lat, endPub.lon);
+                        
+                        if (isNaN(distFromCurrent) || isNaN(distToEnd)) continue;
+                        
+                        let score;
+                        
+                        if (i === sequence.length - 2) {
+                            if (distToEnd > 1.0) {
+                                const penalty = (distToEnd - 1.0) * 5;
+                                score = (distFromCurrent * 0.3) + (distToEnd * 0.7) + penalty;
+                            } else {
+                                score = (distFromCurrent * 0.4) + (distToEnd * 0.6);
+                            }
+                        } else {
+                            const progressWeight = 0.3 + (i / sequence.length * 0.3);
+                            const nearWeight = 1 - progressWeight;
+                            score = (distFromCurrent * nearWeight) + (distToEnd * progressWeight);
+                        }
+                        
+                        scoredCandidates.push({ pub, score });
+                    }
+                    
+                    if (scoredCandidates.length === 0) return null;
+                    
+                    scoredCandidates.sort((a, b) => a.score - b.score);
+                    
+                    let selectedPub;
+                    if (variation === 0) {
+                        selectedPub = scoredCandidates[0].pub;
+                    } else {
+                        const topN = Math.min(8, scoredCandidates.length);
+                        const index = (variation - 1) % topN;
+                        selectedPub = scoredCandidates[index].pub;
+                    }
+                    
+                    const stepDist = calculateDistance(currentLat, currentLon, selectedPub.lat, selectedPub.lon);
+                    route.push({ pub: selectedPub, distance: stepDist, letter: targetLetter });
+                    usedPubIds.add(selectedPub.name + selectedPub.lat);
+                    currentLat = selectedPub.lat;
+                    currentLon = selectedPub.lon;
+                    totalDistance += stepDist;
+                }
+
+                return { route, totalDistance };
+            };
+
+            const calculateOptimalRoutes = () => {
+                try {
+                    setStatusMessage('Starting calculation...');
+                    setDebugLog([]);
+                    
+                    const ePubs = pubs.filter(p => p.firstLetter === 'E');
+                    if (ePubs.length === 0) {
+                        setStatusMessage('ERROR: No pubs starting with E found!');
+                        return;
+                    }
+                    
+                    ePubs.sort((a, b) => {
+                        const distA = calculateDistance(a.lat, a.lon, homeLocation.lat, homeLocation.lon);
+                        const distB = calculateDistance(b.lat, b.lon, homeLocation.lat, homeLocation.lon);
+                        return distA - distB;
+                    });
+                    
+                    const closestEPub = ePubs[0];
+                    const closestEDist = calculateDistance(closestEPub.lat, closestEPub.lon, homeLocation.lat, homeLocation.lon);
+                    
+                    setStatusMessage(`Found ${ePubs.length} E pubs. Using closest to Oval as endpoint...`);
+                    setDebugLog([
+                        `Closest E pub to Oval: ${closestEPub.name} (${closestEDist.toFixed(2)}km away)`,
+                        `All routes will end at this pub`
+                    ]);
+                    
+                    const letterCounts = {};
+                    pubs.forEach(p => {
+                        letterCounts[p.firstLetter] = (letterCounts[p.firstLetter] || 0) + 1;
+                    });
+                    
+                    const needed = { G: 2, L: 1, Y: 1, P: 1, H: 1, O: 2, S: 1, E: 1 };
+                    const missing = [];
+                    for (const [letter, count] of Object.entries(needed)) {
+                        if (!letterCounts[letter] || letterCounts[letter] < count) {
+                            missing.push(`${letter} (need ${count}, have ${letterCounts[letter] || 0})`);
+                        }
+                    }
+                    
+                    if (missing.length > 0) {
+                        setStatusMessage(`ERROR: Missing letters: ${missing.join(', ')}`);
+                        return;
+                    }
+                    
+                    let gPubs = pubs.filter(p => p.firstLetter === 'G');
+                    
+                    if (startingPub) {
+                        gPubs = [startingPub];
+                        setStatusMessage(`Finding routes from ${startingPub.name} to ${closestEPub.name}...`);
+                        setDebugLog(prev => [...prev, `Generating multiple route variations from ${startingPub.name}...`]);
+                    } else if (startingArea !== 'any') {
+                        const areaCoords = {
+                            soho: { lat: 51.5136, lon: -0.1358 }, coventGarden: { lat: 51.5117, lon: -0.1232 },
+                            westEnd: { lat: 51.5144, lon: -0.1419 }, fitzrovia: { lat: 51.5211, lon: -0.1390 },
+                            holborn: { lat: 51.5174, lon: -0.1203 }, clerkenwell: { lat: 51.5237, lon: -0.1039 },
+                            camden: { lat: 51.5392, lon: -0.1426 }, islington: { lat: 51.5416, lon: -0.1030 },
+                            kingsCross: { lat: 51.5308, lon: -0.1238 }, hampstead: { lat: 51.5556, lon: -0.1778 },
+                            highgate: { lat: 51.5717, lon: -0.1467 }, kentishTown: { lat: 51.5507, lon: -0.1405 },
+                            shoreditch: { lat: 51.5251, lon: -0.0823 }, hackney: { lat: 51.5450, lon: -0.0553 },
+                            dalston: { lat: 51.5478, lon: -0.0754 }, bethnal: { lat: 51.5273, lon: -0.0552 },
+                            spitalfields: { lat: 51.5189, lon: -0.0749 }, canaryWharf: { lat: 51.5054, lon: -0.0235 },
+                            stratford: { lat: 51.5416, lon: -0.0042 }, notting: { lat: 51.5095, lon: -0.1957 },
+                            portobello: { lat: 51.5153, lon: -0.2058 }, kensington: { lat: 51.4990, lon: -0.1938 },
+                            chelsea: { lat: 51.4875, lon: -0.1687 }, fulham: { lat: 51.4822, lon: -0.1950 },
+                            hammersmith: { lat: 51.4927, lon: -0.2339 }, shepherdsBush: { lat: 51.5074, lon: -0.2239 },
+                            southBank: { lat: 51.5074, lon: -0.1198 }, borough: { lat: 51.5005, lon: -0.0909 },
+                            bermondsey: { lat: 51.4978, lon: -0.0637 }, peckham: { lat: 51.4739, lon: -0.0692 },
+                            brixton: { lat: 51.4613, lon: -0.1157 }, clapham: { lat: 51.4618, lon: -0.1384 },
+                            balham: { lat: 51.4431, lon: -0.1527 }, stockwell: { lat: 51.4721, lon: -0.1230 },
+                            camberwell: { lat: 51.4741, lon: -0.0910 }, dulwich: { lat: 51.4446, lon: -0.0861 },
+                            greenwich: { lat: 51.4825, lon: 0.0091 }, newCross: { lat: 51.4760, lon: -0.0324 },
+                            deptford: { lat: 51.4784, lon: -0.0265 }, lewisham: { lat: 51.4654, lon: -0.0145 },
+                            catford: { lat: 51.4446, lon: -0.0208 }, wimbledon: { lat: 51.4214, lon: -0.2063 },
+                            putney: { lat: 51.4618, lon: -0.2155 }, wandsworth: { lat: 51.4571, lon: -0.1910 },
+                            tooting: { lat: 51.4275, lon: -0.1687 }, streatham: { lat: 51.4318, lon: -0.1255 }
+                        };
+                        
+                        const areaCenter = areaCoords[startingArea];
+                        if (areaCenter) {
+                            gPubs = gPubs.filter(g => {
+                                const dist = calculateDistance(g.lat, g.lon, areaCenter.lat, areaCenter.lon);
+                                return dist <= 1.5;
+                            }).sort((a, b) => {
+                                const distA = calculateDistance(a.lat, a.lon, areaCenter.lat, areaCenter.lon);
+                                const distB = calculateDistance(b.lat, b.lon, areaCenter.lat, areaCenter.lon);
+                                return distA - distB;
+                            });
+                            
+                            setStatusMessage(`Finding routes from ${startingArea} to ${closestEPub.name}...`);
+                            setDebugLog(prev => [...prev, `Found ${gPubs.length} G pubs in ${startingArea}`]);
+                        }
+                    } else {
+                        setStatusMessage(`Finding best routes ending at ${closestEPub.name}...`);
+                    }
+                    
+                    if (gPubs.length === 0) {
+                        setStatusMessage('ERROR: No suitable starting pubs found in selected area!');
+                        return;
+                    }
+                    
+                    const allRoutes = [];
+                    const maxToTest = startingPub ? 1 : Math.min(30, gPubs.length);
+                    
+                    setDebugLog(prev => [...prev, `Testing ${maxToTest} starting points (routes will move towards Oval)...`]);
+                    
+                    if (startingPub) {
+                        for (let v = 0; v < 30; v++) {
+                            const route = generateRouteForward(startingPub, closestEPub, pubs, v, mustVisitPubs);
+                            if (route) {
+                                route.distanceToHome = closestEDist;
+                                route.endPubName = closestEPub.name;
+                                route.startPubName = startingPub.name;
+                                route.variation = v;
+                                allRoutes.push(route);
+                            }
+                        }
+                        setDebugLog(prev => [...prev, `Generated ${allRoutes.length} different routes from ${startingPub.name}`]);
+                    } else {
+                        for (let i = 0; i < maxToTest; i++) {
+                            const variationsPerStart = startingArea !== 'any' ? 3 : 1;
+                            for (let v = 0; v < variationsPerStart; v++) {
+                                const route = generateRouteForward(gPubs[i], closestEPub, pubs, v, mustVisitPubs);
+                                if (route) {
+                                    route.distanceToHome = closestEDist;
+                                    route.endPubName = closestEPub.name;
+                                    route.startPubName = gPubs[i].name;
+                                    allRoutes.push(route);
+                                }
+                            }
+                            
+                            if (i % 10 === 0 && i > 0) {
+                                setDebugLog(prev => [...prev, `Processed ${i} starting points, found ${allRoutes.length} routes...`]);
+                            }
+                        }
+                    }
+                    
+                    if (allRoutes.length === 0) {
+                        setStatusMessage('ERROR: Could not generate any valid routes!');
+                        return;
+                    }
+                    
+                    allRoutes.sort((a, b) => a.totalDistance - b.totalDistance);
+                    const topRoutes = allRoutes.slice(0, 10);
+                    setRoutes(topRoutes);
+                    
+                    setDebugLog(prev => [...prev, 
+                        `✅ Complete! All routes end at ${closestEPub.name} (${closestEDist.toFixed(2)}km from Oval)`,
+                        `Shortest route: ${topRoutes[0].totalDistance.toFixed(2)}km from ${topRoutes[0].startPubName}`
+                    ]);
+                    setStatusMessage(`SUCCESS! Top ${topRoutes.length} routes, all ending at ${closestEPub.name}.`);
+                } catch (error) {
+                    setStatusMessage(`ERROR: ${error.message}`);
+                    setDebugLog(prev => [...prev, `Exception: ${error.message}`]);
+                }
+            };
+
+            const openInGoogleMaps = (route) => {
+                const stops = route.route.map(stop => `${stop.pub.lat},${stop.pub.lon}`);
+                if (stops.length > 10) {
+                    alert(`Google Maps supports a maximum of 10 stops. This route has ${stops.length} stops. Opening first 10 stops only.`);
+                }
+                const limitedStops = stops.slice(0, 10);
+                const mapsUrl = `https://www.google.com/maps/dir/${limitedStops.join('/')}`;
+                window.open(mapsUrl, '_blank');
+            };
+
+            const downloadRouteCSV = (route, routeIndex) => {
+                const headers = ['Stop', 'Letter', 'Pub Name', 'Distance from Previous (km)', 'Latitude', 'Longitude', 'Address'];
+                const rows = route.route.map((stop, idx) => [
+                    idx + 1, stop.letter, `"${stop.pub.name}"`,
+                    stop.distance.toFixed(2), stop.pub.lat, stop.pub.lon, `"${stop.pub.address}"`
+                ]);
+                const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `route-${routeIndex + 1}.csv`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+            };
+
+            const getSortedPubs = () => {
+                let filtered = filterLetter === 'all' ? pubs : pubs.filter(p => p.firstLetter === filterLetter);
+                return [...filtered].sort((a, b) => {
+                    if (sortBy === 'letter') {
+                        return a.firstLetter.localeCompare(b.firstLetter) || a.name.localeCompare(b.name);
+                    } else {
+                        return a.name.localeCompare(b.name);
+                    }
+                });
+            };
+
+            const downloadCSV = () => {
+                const sorted = getSortedPubs();
+                const headers = ['Pub Name', 'First Letter', 'Latitude', 'Longitude', 'Address', 'City'];
+                const rows = sorted.map(pub => [
+                    `"${pub.name}"`, pub.firstLetter, pub.lat, pub.lon, `"${pub.address}"`, `"${pub.city}"`
+                ]);
+                const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'pub-crawl-data.csv';
+                a.click();
+                window.URL.revokeObjectURL(url);
+            };
+
+            const getLetterCounts = () => {
+                const counts = {};
+                pubs.forEach(pub => {
+                    counts[pub.firstLetter] = (counts[pub.firstLetter] || 0) + 1;
+                });
+                return counts;
+            };
+
+            const letterCounts = getLetterCounts();
+            const sortedPubs = getSortedPubs();
+            const targetLetters = ['G', 'L', 'Y', 'P', 'H', 'G', 'O', 'O', 'S', 'E'];
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 p-8">
+                    <div className="max-w-6xl mx-auto">
+                        <div className="bg-gray-800 rounded-lg shadow-2xl p-8 border border-gray-700">
+                            <h1 className="text-3xl font-bold text-amber-400 mb-2 flex items-center gap-2">
+                                <MapPin size={24} className="text-amber-500" />
+                                GLYPH & GOOSE Pub Crawl Planner
+                            </h1>
+                            <p className="text-gray-400 mb-6">Upload your pub data to plan your optimal pub crawl route</p>
+
+                            <div className="mb-6">
+                                <label className="flex items-center justify-center w-full px-4 py-6 bg-gray-700 border-2 border-dashed border-amber-600 rounded-lg cursor-pointer hover:bg-gray-600 transition">
+                                    <Upload size={20} className="mr-2 text-amber-500" />
+                                    <span className="text-amber-400 font-medium">Upload GeoJSON File</span>
+                                    <input type="file" accept=".json,.geojson" onChange={handleFileUpload} className="hidden" />
+                                </label>
                             </div>
-                          ))}
+
+                            {pubs.length > 0 && (
+                                <>
+                                    <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
+                                        <h3 className="font-semibold text-amber-400 mb-3">Starting Location Options:</h3>
+                                        <div className="grid grid-cols-2 gap-4 mb-4">
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-300 mb-2">Choose Starting Area:</label>
+                                                <select 
+                                                    value={startingArea} 
+                                                    onChange={(e) => {
+                                                        setStartingArea(e.target.value);
+                                                        setStartingPub(null);
+                                                    }}
+                                                    className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
+                                                >
+                                                    <option value="any">Any Location</option>
+                                                    <optgroup label="Central London">
+                                                        <option value="soho">Soho</option>
+                                                        <option value="coventGarden">Covent Garden</option>
+                                                        <option value="westEnd">West End</option>
+                                                        <option value="fitzrovia">Fitzrovia</option>
+                                                        <option value="holborn">Holborn</option>
+                                                        <option value="clerkenwell">Clerkenwell</option>
+                                                    </optgroup>
+                                                    <optgroup label="North London">
+                                                        <option value="camden">Camden</option>
+                                                        <option value="islington">Islington</option>
+                                                        <option value="kingsCross">King's Cross</option>
+                                                        <option value="hampstead">Hampstead</option>
+                                                        <option value="highgate">Highgate</option>
+                                                        <option value="kentishTown">Kentish Town</option>
+                                                    </optgroup>
+                                                    <optgroup label="East London">
+                                                        <option value="shoreditch">Shoreditch</option>
+                                                        <option value="hackney">Hackney</option>
+                                                        <option value="dalston">Dalston</option>
+                                                        <option value="bethnal">Bethnal Green</option>
+                                                        <option value="spitalfields">Spitalfields</option>
+                                                        <option value="canaryWharf">Canary Wharf</option>
+                                                        <option value="stratford">Stratford</option>
+                                                    </optgroup>
+                                                    <optgroup label="West London">
+                                                        <option value="notting">Notting Hill</option>
+                                                        <option value="portobello">Portobello</option>
+                                                        <option value="kensington">Kensington</option>
+                                                        <option value="chelsea">Chelsea</option>
+                                                        <option value="fulham">Fulham</option>
+                                                        <option value="hammersmith">Hammersmith</option>
+                                                        <option value="shepherdsBush">Shepherd's Bush</option>
+                                                    </optgroup>
+                                                    <optgroup label="South London">
+                                                        <option value="southBank">South Bank</option>
+                                                        <option value="borough">Borough</option>
+                                                        <option value="bermondsey">Bermondsey</option>
+                                                        <option value="peckham">Peckham</option>
+                                                        <option value="brixton">Brixton</option>
+                                                        <option value="clapham">Clapham</option>
+                                                        <option value="balham">Balham</option>
+                                                        <option value="stockwell">Stockwell</option>
+                                                        <option value="camberwell">Camberwell</option>
+                                                        <option value="dulwich">Dulwich</option>
+                                                        <option value="greenwich">Greenwich</option>
+                                                    </optgroup>
+                                                    <optgroup label="Southeast London">
+                                                        <option value="newCross">New Cross</option>
+                                                        <option value="deptford">Deptford</option>
+                                                        <option value="lewisham">Lewisham</option>
+                                                        <option value="catford">Catford</option>
+                                                    </optgroup>
+                                                    <optgroup label="Southwest London">
+                                                        <option value="wimbledon">Wimbledon</option>
+                                                        <option value="putney">Putney</option>
+                                                        <option value="wandsworth">Wandsworth</option>
+                                                        <option value="tooting">Tooting</option>
+                                                        <option value="streatham">Streatham</option>
+                                                    </optgroup>
+                                                </select>
+                                            </div>
+                                            
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-300 mb-2">Or Pick Specific Pub:</label>
+                                                <select 
+                                                    value={startingPub ? startingPub.name : ''} 
+                                                    onChange={(e) => {
+                                                        const pub = pubs.find(p => p.name === e.target.value && p.firstLetter === 'G');
+                                                        setStartingPub(pub || null);
+                                                        if (pub) setStartingArea('any');
+                                                    }}
+                                                    className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
+                                                >
+                                                    <option value="">Select a G pub...</option>
+                                                    {pubs.filter(p => p.firstLetter === 'G').sort((a, b) => a.name.localeCompare(b.name)).map((pub, idx) => (
+                                                        <option key={idx} value={pub.name}>{pub.name}</option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <p className="text-xs text-gray-400">
+                                            {startingPub 
+                                                ? `Routes will start from ${startingPub.name} and head towards Oval` 
+                                                : startingArea !== 'any' 
+                                                    ? `Routes will start from ${startingArea} area and head towards Oval`
+                                                    : 'Routes will consider all possible starting points'}
+                                        </p>
+                                    </div>
+
+                                    <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
+                                        <h3 className="font-semibold text-amber-400 mb-3">Must-Visit Pubs (Optional):</h3>
+                                        <p className="text-xs text-gray-400 mb-3">Select pubs that MUST be included in your route. Routes will be built around these stops.</p>
+                                        <div className="mb-3">
+                                            <label className="block text-sm font-medium text-gray-300 mb-2">Add Must-Visit Pub:</label>
+                                            <select 
+                                                onChange={(e) => {
+                                                    if (e.target.value) {
+                                                        const [name, lat] = e.target.value.split('|');
+                                                        const pub = pubs.find(p => p.name === name && p.lat === parseFloat(lat));
+                                                        if (pub && !mustVisitPubs.find(m => m.name === pub.name && m.lat === pub.lat)) {
+                                                            setMustVisitPubs([...mustVisitPubs, pub]);
+                                                        }
+                                                        e.target.value = '';
+                                                    }
+                                                }}
+                                                className="w-full px-4 py-2 bg-gray-800 border border-gray-600 rounded-lg text-gray-100"
+                                            >
+                                                <option value="">Select a pub to add...</option>
+                                                {['G', 'L', 'Y', 'P', 'H', 'O', 'S'].map(letter => (
+                                                    <optgroup key={letter} label={`${letter} Pubs`}>
+                                                        {pubs
+                                                            .filter(p => p.firstLetter === letter)
+                                                            .sort((a, b) => a.name.localeCompare(b.name))
+                                                            .map((pub, idx) => (
+                                                                <option key={idx} value={`${pub.name}|${pub.lat}`}>
+                                                                    {pub.name} - {getAreaName(pub)}
+                                                                </option>
+                                                            ))}
+                                                    </optgroup>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        {mustVisitPubs.length > 0 && (
+                                            <div className="space-y-2">
+                                                <p className="text-sm text-gray-300 font-medium">Must-visit pubs ({mustVisitPubs.length}):</p>
+                                                {mustVisitPubs.map((pub, idx) => (
+                                                    <div key={idx} className="flex items-center justify-between bg-gray-800 p-2 rounded">
+                                                        <div>
+                                                            <span className="font-bold text-amber-400">{pub.firstLetter}</span>
+                                                            <span className="text-gray-200 ml-2">{pub.name}</span>
+                                                            <span className="text-gray-400 text-xs ml-2">({getAreaName(pub)})</span>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => setMustVisitPubs(mustVisitPubs.filter((_, i) => i !== idx))}
+                                                            className="px-2 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
+                                                        >
+                                                            Remove
+                                                        </button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="mb-6 p-4 bg-gray-700 rounded-lg border border-gray-600">
+                                        <h3 className="font-semibold text-amber-400 mb-3">Letters needed for "GLYPH & GOOSE":</h3>
+                                        <div className="flex flex-wrap gap-3">
+                                            {targetLetters.map((letter, idx) => {
+                                                const count = letterCounts[letter] || 0;
+                                                const needed = targetLetters.filter(l => l === letter).length;
+                                                return (
+                                                    <div key={idx} className={`px-3 py-2 rounded ${count >= needed ? 'bg-green-900 border-green-600' : 'bg-red-900 border-red-600'} border`}>
+                                                        <span className="font-bold text-lg text-gray-100">{letter}</span>
+                                                        <span className="text-sm ml-2 text-gray-300">({count} found, {needed} needed)</span>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+
+                                    <div className="mb-6">
+                                        <button 
+                                            onClick={calculateOptimalRoutes}
+                                            className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition flex items-center gap-2 font-semibold"
+                                        >
+                                            <Zap size={20} />
+                                            Generate Optimal Routes
+                                        </button>
+                                        
+                                        {statusMessage && (
+                                            <div className={`mt-4 p-3 rounded ${statusMessage.includes('ERROR') ? 'bg-red-900 border border-red-600' : 'bg-blue-900 border border-blue-600'}`}>
+                                                <p className="text-sm text-gray-100">{statusMessage}</p>
+                                            </div>
+                                        )}
+                                        
+                                        {debugLog.length > 0 && (
+                                            <div className="mt-4 p-3 rounded bg-gray-900 border border-gray-600 max-h-60 overflow-y-auto">
+                                                <p className="text-xs font-bold text-amber-400 mb-2">Debug Log:</p>
+                                                {debugLog.map((log, idx) => (
+                                                    <p key={idx} className="text-xs text-gray-300 font-mono">{log}</p>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {routes.length > 0 && (
+                                        <div className="mb-8">
+                                            <h2 className="text-2xl font-bold text-amber-400 mb-4 flex items-center gap-2">
+                                                <Navigation size={24} className="text-green-500" />
+                                                Top {routes.length} Routes
+                                                {startingPub && <span className="text-sm text-gray-400">(from {startingPub.name})</span>}
+                                                {!startingPub && startingArea !== 'any' && <span className="text-sm text-gray-400">(from {startingArea})</span>}
+                                            </h2>
+                                            {routes.map((route, idx) => (
+                                                <div key={idx} className="mb-6 p-4 bg-gray-700 border-2 border-green-600 rounded-lg">
+                                                    <div className="flex justify-between items-center mb-3">
+                                                        <div>
+                                                            <h3 className="text-xl font-semibold text-green-400">
+                                                                Route {idx + 1} - {route.totalDistance.toFixed(2)} km ({(route.totalDistance * 0.621371).toFixed(2)} mi)
+                                                            </h3>
+                                                            <p className="text-sm text-gray-300 mt-1">
+                                                                📍 {route.startPubName} → {route.endPubName}
+                                                            </p>
+                                                            <p className="text-xs text-green-300 mt-1">
+                                                                Ending {route.distanceToHome.toFixed(2)} km from Oval
+                                                            </p>
+                                                        </div>
+                                                        <div className="flex gap-2">
+                                                            <button 
+                                                                onClick={() => openInGoogleMaps(route)}
+                                                                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition flex items-center gap-2 text-sm"
+                                                            >
+                                                                <MapPin size={16} />
+                                                                Open in Maps
+                                                            </button>
+                                                            <button 
+                                                                onClick={() => downloadRouteCSV(route, idx)}
+                                                                className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition flex items-center gap-2 text-sm"
+                                                            >
+                                                                <Download size={16} />
+                                                                Download CSV
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        {route.route.map((stop, stopIdx) => (
+                                                            <div key={stopIdx} className="flex items-center gap-3 p-2 bg-gray-800 rounded border border-gray-600">
+                                                                <div className="flex-shrink-0 w-8 h-8 bg-green-600 text-white rounded-full flex items-center justify-center font-bold text-sm">
+                                                                    {stopIdx + 1}
+                                                                </div>
+                                                                <div className="flex-shrink-0 w-8 h-8 bg-amber-500 text-white rounded flex items-center justify-center font-bold">
+                                                                    {stop.letter}
+                                                                </div>
+                                                                <div className="flex-grow">
+                                                                    <div className="font-semibold text-gray-100">{stop.pub.name}</div>
+                                                                    <div className="text-sm text-gray-400">{stop.pub.address}</div>
+                                                                </div>
+                                                                {stopIdx > 0 && (
+                                                                    <div className="text-sm text-green-400 font-mono">
+                                                                        +{stop.distance.toFixed(2)} km
+                                                                    </div>
+                                                                )}
+                                                                {stopIdx === route.route.length - 1 && (
+                                                                    <div className="text-xs text-blue-400">
+                                                                        🏠 Closest to Oval
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+
+                                    <div className="flex gap-4 mb-6 flex-wrap">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-300 mb-1">Filter by Letter:</label>
+                                            <select 
+                                                value={filterLetter} 
+                                                onChange={(e) => setFilterLetter(e.target.value)}
+                                                className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100"
+                                            >
+                                                <option value="all">All Letters</option>
+                                                {['G', 'L', 'Y', 'P', 'H', 'O', 'S', 'E'].map(letter => (
+                                                    <option key={letter} value={letter}>{letter} ({letterCounts[letter] || 0})</option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-300 mb-1">Sort by:</label>
+                                            <select 
+                                                value={sortBy} 
+                                                onChange={(e) => setSortBy(e.target.value)}
+                                                className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100"
+                                            >
+                                                <option value="letter">Letter</option>
+                                                <option value="name">Name</option>
+                                            </select>
+                                        </div>
+
+                                        <div className="ml-auto">
+                                            <label className="block text-sm font-medium text-gray-300 mb-1">&nbsp;</label>
+                                            <button 
+                                                onClick={downloadCSV}
+                                                className="px-6 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition flex items-center gap-2"
+                                            >
+                                                <Download size={18} />
+                                                Download All Pubs CSV
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="overflow-x-auto rounded-lg border border-gray-700">
+                                        <table className="w-full border-collapse">
+                                            <thead>
+                                                <tr className="bg-gray-700">
+                                                    <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Letter</th>
+                                                    <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Pub Name</th>
+                                                    <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Latitude</th>
+                                                    <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Longitude</th>
+                                                    <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Address</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {sortedPubs.map((pub, idx) => (
+                                                    <tr key={idx} className="hover:bg-gray-700 transition">
+                                                        <td className="border border-gray-600 px-4 py-2 font-bold text-amber-500">{pub.firstLetter}</td>
+                                                        <td className="border border-gray-600 px-4 py-2 text-gray-200">{pub.name}</td>
+                                                        <td className="border border-gray-600 px-4 py-2 font-mono text-sm text-gray-300">{pub.lat}</td>
+                                                        <td className="border border-gray-600 px-4 py-2 font-mono text-sm text-gray-300">{pub.lon}</td>
+                                                        <td className="border border-gray-600 px-4 py-2 text-sm text-gray-400">{pub.address}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+
+                                    <p className="mt-4 text-gray-400 text-sm">Total pubs found: {sortedPubs.length}</p>
+                                </>
+                            )}
+
+                            {pubs.length === 0 && (
+                                <div className="text-center py-12 text-gray-500">
+                                    <MapPin size={48} className="mx-auto mb-4 opacity-50" />
+                                    <p>Upload a GeoJSON file to get started!</p>
+                                </div>
+                            )}
                         </div>
-                      )}
-
-                      <div className="flex gap-4 mb-6 flex-wrap">
-                        <div>
-                          <label className="block text-sm font-medium text-gray-300 mb-1">Filter by Letter:</label>
-                          <select 
-                            value={filterLetter} 
-                            onChange={(e) => setFilterLetter(e.target.value)}
-                            className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100"
-                          >
-                            <option value="all">All Letters</option>
-                            {['G', 'L', 'Y', 'P', 'H', 'O', 'S', 'E'].map(letter => (
-                              <option key={letter} value={letter}>{letter} ({letterCounts[letter] || 0})</option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div>
-                          <label className="block text-sm font-medium text-gray-300 mb-1">Sort by:</label>
-                          <select 
-                            value={sortBy} 
-                            onChange={(e) => setSortBy(e.target.value)}
-                            className="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100"
-                          >
-                            <option value="letter">Letter</option>
-                            <option value="name">Name</option>
-                          </select>
-                        </div>
-
-                        <div className="ml-auto">
-                          <label className="block text-sm font-medium text-gray-300 mb-1">&nbsp;</label>
-                          <button 
-                            onClick={downloadCSV}
-                            className="px-6 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition flex items-center gap-2"
-                          >
-                            <DownloadIcon />
-                            Download All Pubs CSV
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="overflow-x-auto rounded-lg border border-gray-700">
-                        <table className="w-full border-collapse">
-                          <thead>
-                            <tr className="bg-gray-700">
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Letter</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Pub Name</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Latitude</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Longitude</th>
-                              <th className="border border-gray-600 px-4 py-2 text-left text-amber-400">Address</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {sortedPubs.map((pub, idx) => (
-                              <tr key={idx} className="hover:bg-gray-700 transition">
-                                <td className="border border-gray-600 px-4 py-2 font-bold text-amber-500">{pub.firstLetter}</td>
-                                <td className="border border-gray-600 px-4 py-2 text-gray-200">{pub.name}</td>
-                                <td className="border border-gray-600 px-4 py-2 font-mono text-sm text-gray-300">{pub.lat}</td>
-                                <td className="border border-gray-600 px-4 py-2 font-mono text-sm text-gray-300">{pub.lon}</td>
-                                <td className="border border-gray-600 px-4 py-2 text-sm text-gray-400">{pub.address}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <p className="mt-4 text-gray-400 text-sm">Total pubs found: {sortedPubs.length}</p>
-                    </>
-                  )}
-
-                  {pubs.length === 0 && (
-                    <div className="text-center py-12 text-gray-500">
-                      <MapPinIcon />
-                      <p className="mt-4">Upload a GeoJSON file to get started!</p>
                     </div>
-                  )}
                 </div>
-              </div>
-            </div>
-          );
+            );
         }
 
         ReactDOM.render(<PubCrawlPlanner />, document.getElementById('root'));
